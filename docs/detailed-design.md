@@ -4,32 +4,102 @@
 
 ## Purpose
 
+**Requirements:** [LQ-INT-001](requirements.md#lq-int-001), [LQ-APP-001](requirements.md#lq-app-001), [LQ-CON-003](requirements.md#lq-con-003), [LQ-ENV-001](requirements.md#lq-env-001), [LQ-PRG-008](requirements.md#lq-prg-008)
+
 > **Prototype language:** This document specifies the Python prototype. Python classes, data classes, protocols, enums, and type annotations express the intended contracts. The final public design and implementation will be in C; its types, ownership rules, function signatures, and ABI will be defined separately from this prototype.
 
-This design describes the SC26 library boundary and the flow from application program input to managed QPM execution and result delivery. The application owns algorithmic control flow, parameter updates, and data binding. libquantum owns route discovery and selection, compiler invocation, QRI submission, task tracking, and delivery to application completion queues. Graph construction and execution are future convenience layers over these APIs. The design maps to the observable behavior in `docs/requirements.md`; upstream proposals and the Backline prototype are not treated as available execution functionality.
+This design describes the SC26 library boundary and the flow from application program input to managed QPM execution and result delivery. The application owns algorithmic control flow, parameter updates, data binding, and final route choice. libquantum owns route discovery and filtering, route-instance creation, compiler binding, QRI submission, and registration of application completion queues with QRI. Graph construction and execution are future convenience layers over these APIs. The design maps to the observable behavior in `docs/requirements.md`; upstream proposals and the Backline prototype are not treated as available execution functionality.
+
+**Status:** draft
+
+## Application Workflow
+
+**Requirements:** [LQ-INT-001](requirements.md#lq-int-001), [LQ-INT-002](requirements.md#lq-int-002), [LQ-INT-003](requirements.md#lq-int-003), [LQ-APP-001](requirements.md#lq-app-001), [LQ-APP-002](requirements.md#lq-app-002), [LQ-COMP-009](requirements.md#lq-comp-009), [LQ-DEMOINT-004](requirements.md#lq-demoint-004), [LQ-DEMOINT-005](requirements.md#lq-demoint-005)
+
+This example is the reference application flow for the Python prototype. Route choice, compilation, and submission are separate application operations. The final C API preserves the same flow with C handles, callbacks, return codes, and ownership functions.
+
+```python
+from qiskit import QuantumCircuit
+
+from libquantum import ExecutionOptions, finalize, initialize
+
+
+context = initialize()
+completion_queue = None
+
+try:
+    circuit = QuantumCircuit(4)
+    circuit.h(0)
+    circuit.cx(0, 1)
+    circuit.measure_all()
+
+    program = context.import_program(circuit)
+    route_query = context.list_routes(program, explain=True)
+    if not route_query.routes:
+        raise RuntimeError("no eligible route")
+
+    # The application owns route choice.
+    route = context.open_route(route_query.routes[0])
+    completion_queue = context.create_completion_queue(route)
+
+    # Compilation is independent of submission.
+    compiled = context.compile(route, program)
+
+    pending = {}
+    for iteration in range(3):
+        op_id = context.run(
+            route,
+            compiled,
+            completion_queue,
+            execution_options=ExecutionOptions(shots=1000),
+        )
+        pending[op_id] = {"iteration": iteration}
+
+    for op_id in pending:
+        current = context.status(op_id)
+
+    while pending:
+        if not completion_queue.wait(timeout=300):
+            raise TimeoutError(f"{len(pending)} operations remain incomplete")
+
+        for completion in completion_queue.get():
+            application_operation = pending.pop(completion.op_id)
+            if completion.error is not None:
+                application_operation["error"] = completion.error
+            else:
+                application_operation["qri_completion"] = completion.result
+finally:
+    if completion_queue is not None:
+        completion_queue.close()
+    finalized = finalize(context, timeout=300)
+```
+
+`import_program()` identifies the SDK object. `list_routes()` returns every eligible `AvailableRoute`; libquantum does not rank or choose among them. The application chooses one and `open_route()` binds its compiler state, device access, negotiated format, and QRI path. `compile()` invokes only the bound compiler integration and does not submit. `run()` accepts the compiler result, submits it through the bound QRI/QPM path, extracts QRI `cid`, tracks that value internally, and returns it as `op_id`.
+
+`status(op_id)` calls the owning QPM's `task_status`. `cancel(op_id)` calls its `cancel_task`. QRI/QPM pushes the terminal event into the selected endpoint. `CompletionQueue.get()` exposes the same `cid` as `Completion.op_id` and marks the internally tracked operation complete.
+
+```mermaid
+flowchart LR
+    SDK["SDK circuit or serialized payload"] --> Import["import_program()"]
+    Import --> Query["list_routes()"]
+    Query --> Choose["Application chooses"]
+    Choose --> Open["open_route()"]
+    Open --> Compile["compile()"]
+    Compile --> Run["run()"]
+    Run -->|"op_id = QRI cid"| QRI["QRI/QPM"]
+    QRI --> Queue["CompletionQueue"]
+    Queue --> Completion["Completion(op_id)"]
+```
+
+Application code owns route choice, operation ordering, and result interpretation. libquantum owns the QRI operation-to-route/queue mapping needed for status, cancellation, completion, and finalization.
 
 **Status:** draft
 
 ## Application API
 
-The public Python API has two top-level lifecycle functions and one stateful context class. `initialize()` creates all state scoped to the active QFw runtime. Every other operation is a method on that context, which prevents resource, route, task, or queue handles from being used with a different allocation.
+**Requirements:** [LQ-INT-002](requirements.md#lq-int-002), [LQ-INT-003](requirements.md#lq-int-003), [LQ-PRG-001](requirements.md#lq-prg-001), [LQ-PRG-002](requirements.md#lq-prg-002), [LQ-COMP-007](requirements.md#lq-comp-007), [LQ-TASK-001](requirements.md#lq-task-001), [LQ-TASK-002](requirements.md#lq-task-002), [LQ-TASK-003](requirements.md#lq-task-003), [LQ-TASK-004](requirements.md#lq-task-004), [LQ-APP-001](requirements.md#lq-app-001), [LQ-APP-002](requirements.md#lq-app-002)
 
-Data structures used by this API are defined in these sections:
-
-- [Shared Data Model](#shared-data-model): common `VersionSet`, `Diagnostic`, and `CorrelationData` records and the document's Python type conventions.
-- [Program Representation](#program-representation): `Program`, `Representation`, and `ProgramRequirements`.
-- [Device Representation](#device-representation): `Device`, capacity, format, topology, and internal device-access records.
-- [Program Route](#program-route): `ProgramRoute`, which directly references the selected `Compiler` and `Device` representations.
-- [Operation Records](#operation-records): `RouteConstraints`, compilation and execution options, compilation results, provenance, and `TaskHandle`.
-- [Compiler Integration Contract](#compiler-integration-contract): the assembled `Compiler` representation, compiler metadata and capability records, registrations, and callback protocols.
-- [Device Discovery Through QRI](#device-discovery-through-qri): `ResourceSnapshot`.
-- [Initialization and Finalization](#initialization-and-finalization): context and finalization states plus `FinalizeResult`.
-- [Compatibility Mapping](#compatibility-mapping): `CompatibilityMap`, `RouteQueryResult`, and rejected-route records.
-- [Route Selection](#route-selection): `SelectionResult` and policy evidence.
-- [Compilation and Execution](#compilation-and-execution): task phases, `TaskStatus`, remote task identity, and cancellation results.
-- [Completion Queues](#completion-queues): `CompletionQueue`, `Completion`, and terminal outcomes.
-- [Errors, Results, and Provenance](#errors-results-and-provenance): `LibquantumError`, `ErrorDetail`, and error stages.
-- [SC26 Runtime and Qualification Boundary](#sc26-runtime-and-qualification-boundary): `InitConfig`, `RepresentationRegistry`, and representation recognizers.
+The public Python API has lifecycle functions, a stateful `Context`, selected `ProgramRoute` handles, and QRI-backed completion queues. Handles created by one context cannot be mixed with another context. The application explicitly imports a program, queries and chooses a route, compiles when required, and submits the compiler result.
 
 ```python
 def initialize(config: InitConfig | None = None) -> Context: ...
@@ -41,8 +111,6 @@ def finalize(
 
 
 class Context:
-    """Stateful handle for one active QFw allocation context."""
-
     @property
     def context_id(self) -> str: ...
 
@@ -58,6 +126,13 @@ class Context:
         requirements: ProgramRequirements | None = None,
     ) -> Program: ...
 
+    def import_opaque(
+        self,
+        payload: object | bytes | str,
+        *,
+        requirements: ProgramRequirements | None = None,
+    ) -> Program: ...
+
     def list_routes(
         self,
         program: Program | None = None,
@@ -65,63 +140,45 @@ class Context:
         explain: bool = False,
     ) -> RouteQueryResult: ...
 
-    def select_route(
-        self,
-        program: Program,
-        constraints: RouteConstraints | None = None,
-        options: CompilationOptions | None = None,
-    ) -> SelectionResult: ...
-
-    def compile(
-        self,
-        program: Program,
-        route: ProgramRoute | None = None,
-        constraints: RouteConstraints | None = None,
-        options: CompilationOptions | None = None,
-    ) -> CompilationResult: ...
-
-    def run(
-        self,
-        program: Program,
-        completion_queue: CompletionQueue,
-        route: ProgramRoute | None = None,
-        constraints: RouteConstraints | None = None,
-        compilation_options: CompilationOptions | None = None,
-        execution_options: ExecutionOptions | None = None,
-        correlation: CorrelationData | None = None,
-    ) -> TaskHandle: ...
-
-    def task_status(self, task: TaskHandle) -> TaskStatus: ...
-    def cancel(
-        self,
-        task: TaskHandle,
-        reason: str | None = None,
-    ) -> CancellationResult: ...
+    def open_route(self, route: AvailableRoute) -> ProgramRoute: ...
 
     def create_completion_queue(
         self,
-        name: str | None = None,
+        route: ProgramRoute,
     ) -> CompletionQueue: ...
 
-    # Future dedicated API. SC26 uses list_routes(..., explain=True).
-    def compatibility(
+    def compile(
         self,
+        route: ProgramRoute,
         program: Program,
-        compiler_id: str | None = None,
-        device_id: str | None = None,
-        options: CompilationOptions | None = None,
-    ) -> CompatibilityReport: ...
+    ) -> CompilerResult: ...
+
+    def run(
+        self,
+        route: ProgramRoute,
+        executable: CompilerResult | Program,
+        completion_queue: CompletionQueue,
+        execution_options: ExecutionOptions | None = None,
+    ) -> str: ...  # QRI cid, exposed as op_id.
+
+    def status(self, op_id: str) -> Mapping[str, object]: ...
+
+    def cancel(self, op_id: str) -> Mapping[str, object]: ...
 ```
 
-Applications call `import_program()` after constructing a circuit or serialized payload with an SDK. The method classifies and validates the input through the context's representation registry and returns an immutable `Program`; it does not compile, serialize, copy, or submit the payload.
+`import_program()` recognizes and validates; it does not compile, serialize, copy, or submit. Unknown or ambiguous input fails. `import_opaque()` is the only implicit-free opaque path.
 
-`Context` and `CompletionQueue` are stateful classes owned by libquantum. `TaskHandle` is an immutable opaque value. All other named arguments and results are immutable records declared in the data-model or owning-operation sections below.
+`list_routes()` filters the cached map and returns every eligible route in deterministic `route_id` order. It does not rank or choose. The application passes one definition to `open_route()`, which creates a fresh instance with fixed compiler and QRI bindings.
 
-The dedicated `compatibility()` method is future scope; `list_routes(..., explain=True)` provides SC26 compatibility details. `run()` is the only SC26 execution entry point and is asynchronous. A direct `run_compiled()` API is deferred with stored-artifact execution. Graph construction, graph execution, result processing, circuit cutting, public plugin loading, and configurable advanced policies remain outside SC26. Selection, successful compilation, QPM acceptance, and terminal completion are distinct outcomes.
+`compile()` is synchronous and independent of submission. `run()` performs no route selection or compilation. It accepts a `CompilerResult` for a compiled route, or an explicitly opaque `Program` for an opaque route, and returns only the QRI `cid` as `op_id`. The context privately tracks the operation's route, queue, QPM, reservation, and terminal state.
+
+`status()` and `cancel()` require a currently tracked operation ID and dispatch to `task_status` and `cancel_task` on that operation's bound QPM. Graph APIs, automatic route selection, compiler configuration, result processing, and circuit cutting remain future scope.
 
 **Status:** draft
 
 ## Shared Data Model
+
+**Requirements:** [LQ-INT-003](requirements.md#lq-int-003), [LQ-CON-006](requirements.md#lq-con-006)
 
 Every named contract uses one of the following Python forms. The declaration is shown in the same design section that defines its fields and behavior.
 
@@ -137,11 +194,9 @@ Common records used by several contracts are declared here.
 ```python
 @dataclass(frozen=True)
 class VersionSet:
-    """A normalized finite set or inclusive range accepted by the registry."""
+    """Exact versions reported by a compiler or device capability."""
 
-    values: tuple[str, ...] = ()
-    minimum: str | None = None
-    maximum: str | None = None
+    values: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -151,23 +206,17 @@ class Diagnostic:
     severity: Literal["info", "warning", "error"]
     details: Mapping[str, object] = field(default_factory=dict)
 
-
-@dataclass(frozen=True)
-class CorrelationData:
-    """Application data copied unchanged into task status and completion."""
-
-    application_id: str | None = None
-    operation_id: str | None = None
-    values: Mapping[str, object] = field(default_factory=dict)
 ```
 
-Public records are immutable. Handles contain context identity and opaque local identifiers; callers do not construct them. Canonical identifiers are lowercase namespaced strings. Version fields describe the represented contract or implementation and are never inferred from an unrelated package version.
+Public records are immutable. Handles contain context identity and opaque local identifiers; callers do not construct them. Compiler, device, format, and other symbolic identifiers are lowercase namespaced strings. SDK-object representation identities are derived dynamically from the registered Python type as `python:<module>.<qualname>` and preserve the type's case. Version fields describe the represented contract or implementation. libquantum uses only explicitly reported values and does not infer ranges or adjacent-version support.
 
 **Status:** draft
 
 ### Program Representation
 
-`Program` is an immutable value record returned by `Context.import_program()`. It describes the program and preserves the caller's original object or payload. It contains no compiler or execution destination; those decisions belong to `ProgramRoute`. Compilation produces a separate `CompilationResult` and never replaces the source. Applications do not call the `Program` constructor directly because recognition and validation depend on the context's `RepresentationRegistry`.
+**Requirements:** [LQ-PRG-001](requirements.md#lq-prg-001), [LQ-PRG-002](requirements.md#lq-prg-002), [LQ-PRG-003](requirements.md#lq-prg-003), [LQ-PRG-004](requirements.md#lq-prg-004), [LQ-PRG-005](requirements.md#lq-prg-005), [LQ-PRG-007](requirements.md#lq-prg-007), [LQ-PRG-008](requirements.md#lq-prg-008)
+
+`Program` is an immutable value record returned by `Context.import_program()` or `Context.import_opaque()`. It preserves the caller's original object or payload and records how the configured compiler integrations identify it. It contains no compiler or execution destination; those decisions belong to `ProgramRoute`. Applications do not construct `Program` directly.
 
 ```python
 class ProgramKind(str, Enum):
@@ -179,11 +228,11 @@ class ProgramKind(str, Enum):
 @dataclass(frozen=True)
 class Representation:
     kind: ProgramKind
-    name: str                    # qiskit.quantum-circuit, openqasm, qiskit.qpy
-    version: str | None          # format or object-contract version
-    sdk: str | None              # originating SDK when known
+    name: str
+    version: str | None
+    sdk: str | None
     sdk_version: str | None
-    object_type: str | None      # fully qualified Python type for SDK objects
+    object_type: str | None
 
 
 @dataclass(frozen=True)
@@ -200,30 +249,115 @@ class Program:
     requirements: ProgramRequirements = ProgramRequirements()
 ```
 
-The intended application flow is:
+`ProgramKind` classifies the three broad input forms; it does not enumerate SDKs, circuit classes, or serialized formats. Those identities are contributed dynamically by compiler registrations.
+
+The normal application call supplies only the SDK object:
 
 ```python
 circuit = QuantumCircuit(...)
 program = context.import_program(circuit)
-route = context.select_route(program)
-task = context.run(program, completion_queue, route=route)
+route_query = context.list_routes(program)
+route = context.open_route(route_query.routes[0])  # Application choice.
+completion_queue = context.create_completion_queue(route)
+compiled = context.compile(route, program)
+op_id = context.run(route, compiled, completion_queue)
 ```
 
-`import_program()` performs normalization in this deterministic order.
+`import_program()` constructs the `Program` as follows:
 
-1. If the caller supplies `representation`, libquantum validates it against the context registry and uses it.
-2. Otherwise, an exact registered Python-type match identifies supported SDK objects. For example, a Qiskit `QuantumCircuit` maps to `qiskit.quantum-circuit`; `sdk_version` comes from the installed Qiskit distribution. Subclasses are accepted only when the recognizer explicitly declares them.
-3. Otherwise, built-in recognizers may identify a serialized format only from an unambiguous, validated signature. OpenQASM requires its `OPENQASM <version>;` declaration. QPY requires its valid header and encoded QPY version. Compressed or wrapper formats require an explicit representation unless their outer format has its own registered signature.
-4. If recognition is ambiguous or fails, `import_program()` raises `LibquantumError` with `ErrorStage.PROGRAM_IMPORT` and code `UNKNOWN_REPRESENTATION`. libquantum does not silently reinterpret the value as opaque.
-5. To import opaque data, the caller supplies an explicit `Representation(kind=ProgramKind.OPAQUE, name="opaque", version=None, ...)`. No destination is supplied during import.
+```python
+def import_program(
+    self,
+    payload: object | bytes | str,
+    *,
+    representation: Representation | None = None,
+    requirements: ProgramRequirements | None = None,
+) -> Program:
+    self._require_active()
 
-Canonical representation names and version meaning form a small libquantum registry. Compiler integrations report support using those identifiers; they do not invent aliases during registration. Parameter bindings, compilation controls, shot count, correlation data, and execution destination are operation or route inputs rather than properties of the reusable source program. A compiler's `analyze()` callback fills missing program requirements before capacity filtering; caller-supplied requirements are constraints and cannot be weakened by the callback.
+    if representation is not None:
+        identified = self._representations.validate_explicit(
+            payload, representation
+        )
+    else:
+        identified = self._representations.identify_object(payload)
+
+        if identified is None:
+            matches = tuple(
+                match
+                for recognizer in self._representations.serialized_recognizers
+                if (match := recognizer.identify(payload)) is not None
+            )
+            identified = self._require_one_representation(matches)
+
+    return Program(
+        payload=payload,
+        representation=identified,
+        requirements=requirements or ProgramRequirements(),
+    )
+```
+
+An unrecognized or conflicting input does not fall back to opaque forwarding. `_require_one_representation()` raises `UNKNOWN_REPRESENTATION` for no matches and `AMBIGUOUS_REPRESENTATION` for conflicting matches.
+
+Opaque forwarding is an explicit application choice with a concise factory:
+
+```python
+def import_opaque(
+    self,
+    payload: object | bytes | str,
+    *,
+    requirements: ProgramRequirements | None = None,
+) -> Program:
+    self._require_active()
+
+    return Program(
+        payload=payload,
+        representation=Representation(
+            kind=ProgramKind.OPAQUE,
+            name="opaque",
+            version=None,
+            sdk=None,
+            sdk_version=None,
+            object_type=None,
+        ),
+        requirements=requirements or ProgramRequirements(),
+    )
+```
+
+The application call is:
+
+```python
+program = context.import_opaque(payload)
+```
+
+For an SDK object, initialization has already built `object_types` from all `CompilerRegistration.object_types` entries. Lookup is by exact Python type, but the registry retains every compiler's version support for that type. `identify_object()` obtains the installed SDK version, finds registrations whose `sdk_versions` include it, and constructs one canonical program representation. Given a `QuantumCircuit` from an installed Qiskit 2.5 environment, it produces:
+
+```python
+Representation(
+    kind=ProgramKind.SDK_OBJECT,
+    name="python:qiskit.circuit.QuantumCircuit",
+    version="2.5",
+    sdk="qiskit",
+    sdk_version="2.5",
+    object_type="qiskit.circuit.QuantumCircuit",
+)
+```
+
+For an SDK-object representation, `version` is the concrete installed SDK version used to create the object. The representation name is derived from `python_type.__module__` and `python_type.__qualname__`; libquantum does not define an SDK-type enum or know `QuantumCircuit` before registration. Subclasses match only when a compiler registers the subclass explicitly. Route eligibility then retains only compilers whose registration and matching `InputCapability.versions` accept version 2.5; registrations for version 1.5 remain valid but are not eligible for this program.
+
+For bytes and strings, Python type alone is insufficient. The serialized recognizers contributed by compiler registrations validate signatures such as an OpenQASM declaration or QPY header. Identical matches are deduplicated. No match produces `UNKNOWN_REPRESENTATION`; conflicting matches produce `AMBIGUOUS_REPRESENTATION`. Failed recognition never silently becomes opaque.
+
+The application may supply an explicit recognized representation when automatic identification is impossible or undesirable. Opaque input always requires explicit intent, preferably through `import_opaque()`; passing `Representation(kind=ProgramKind.OPAQUE, name="opaque", ...)` to `import_program()` is equivalent. Caller-supplied requirements are preserved; the selected compiler's `analyze()` callback fills missing selection information and cannot weaken caller constraints.
+
+Parameter bindings, future compilation controls, shot count, and execution destination are operation or route inputs rather than properties of the reusable source program.
 
 **Status:** draft
 
 ### Device Representation
 
-The public `Device` is an immutable, allocation-scoped snapshot. `DeviceAccessContext` is a separate internal immutable record containing live QFw bindings and credentials; public APIs never return it.
+**Requirements:** [LQ-DEV-001](requirements.md#lq-dev-001), [LQ-DEV-002](requirements.md#lq-dev-002), [LQ-DEV-003](requirements.md#lq-dev-003), [LQ-DEV-004](requirements.md#lq-dev-004), [LQ-DEMO-003](requirements.md#lq-demo-003)
+
+The public `Device` is an immutable, allocation-scoped snapshot. `DeviceAccessContext` is a separate libquantum-private routing record. It identifies the already-resolved QPM execution and telemetry bindings for one allocated device and carries the reservation and service identifiers required to address those APIs. It is not an authentication or provider-access record, and public APIs and compiler callbacks never receive it.
 
 ```python
 @dataclass(frozen=True)
@@ -260,9 +394,6 @@ class Device:
     display_name: str | None
     provider: str | None
     allocation_id: str
-    reservation_id: str
-    qpm_service_id: str
-    qpm_instance_id: str
     execution_api_version: str
     accepted_inputs: tuple[FormatSupport, ...]
     capacity: DeviceCapacity
@@ -277,17 +408,16 @@ class Device:
 
 @dataclass(frozen=True)
 class DeviceAccessContext:
-    """Internal record passed to compiler integrations, never applications."""
+    """Private QFw call path associated with an allocated device."""
 
     execution_binding: object
     telemetry_binding: object
-    token: object | None
     reservation_id: str
     qpm_service_id: str
     telemetry_library: str | None
 ```
 
-`Device.accepted_inputs` is ordered by `preference`; the native device format has the highest preference. The explicit integer is retained so ordering remains stable across serialization and the final C representation. `usable_qubits` is the capacity used for route eligibility. `physical_qubits` is descriptive and cannot substitute for a smaller reservation limit. `metadata_complete=False` prevents a generic fallback from being presented as a fully characterized target. Multiple routes reference the same `device_id` and `snapshot_generation`.
+`Device` does not expose QPM service or reservation identity. `Context` retains those values only in the internal `DeviceAccessContext` associated with the device. It uses the telemetry binding for unscoped device discovery and binds the execution interface plus reservation identity into each opened route. The allocation and reservation are established before libquantum initialization. QFw authenticates the caller through its RPC transport and QPM resolves provider access from the server-side reservation binding; libquantum does not receive, store, or pass authentication material. `Device.accepted_inputs` is built by mechanically translating the versioned QRI program-input-capability response into `FormatSupport`; `FormatSupport` itself is not a QFw wire type. It is ordered by `preference`; the native device format has the highest preference. The explicit integer is retained so ordering remains stable across serialization and the final C representation. `usable_qubits` is the capacity used for route eligibility. `physical_qubits` is descriptive and cannot substitute for a smaller reservation limit. `metadata_complete=False` prevents a generic fallback from being presented as a fully characterized target. Multiple routes reference the same `device_id` and `snapshot_generation`.
 
 **TODO — QEC and classical resources:** define the QEC codes, decoder/controller/coprocessor capabilities, classical memory/compute constraints, placement data, and versioned schemas needed by Catalyst/Backline routes. Do not add unversioned catch-all fields to `Device`; add typed capability records after the required QRI contracts and selection semantics are known.
 
@@ -295,45 +425,105 @@ class DeviceAccessContext:
 
 ### Program Route
 
-A `ProgramRoute` is an immutable value record representing one concrete compiler-input/compiler-output/device-input mapping. It references capability records already owned by the selected `Compiler` and `Device`; it does not introduce parallel capability descriptions.
+**Requirements:** [LQ-DEV-004](requirements.md#lq-dev-004), [LQ-COMP-004](requirements.md#lq-comp-004), [LQ-SEL-001](requirements.md#lq-sel-001), [LQ-SEL-002](requirements.md#lq-sel-002), [LQ-SEL-003](requirements.md#lq-sel-003)
+
+`AvailableRoute` and `ProgramRoute` represent different lifetimes. An available route is an immutable compatibility-map definition shared by all callers. A program route is a context-owned instance created by `open_route()` for the exact `AvailableRoute` chosen by the application.
 
 ```python
 @dataclass(frozen=True)
-class ProgramRoute:
+class AvailableRoute:
     route_id: str
     compatibility_generation: str
-
     compiler: Compiler | None
     compiler_input: InputCapability | None
     compiler_output: OutputCapability | None
-
     device: Device
     device_input: FormatSupport | None
-
     negotiated_output_version: str | None
+
+
+class ProgramRoute:
+    """Selected route handle with bound compiler and QRI dispatch."""
+
+    instance_id: str
+    definition: AvailableRoute
+
+    # Private bindings installed by Context.open_route().
+    compiler_callbacks: CompilerCallbacks | None
+    compiler_state: object | None
+    device_access: DeviceAccessContext
+
+    @property
+    def route_id(self) -> str: return self.definition.route_id
+
+    @property
+    def compatibility_generation(self) -> str:
+        return self.definition.compatibility_generation
+
+    @property
+    def compiler(self) -> Compiler | None: return self.definition.compiler
+
+    @property
+    def compiler_input(self) -> InputCapability | None:
+        return self.definition.compiler_input
+
+    @property
+    def compiler_output(self) -> OutputCapability | None:
+        return self.definition.compiler_output
+
+    @property
+    def device(self) -> Device: return self.definition.device
+
+    @property
+    def device_input(self) -> FormatSupport | None:
+        return self.definition.device_input
+
+    @property
+    def negotiated_output_version(self) -> str | None:
+        return self.definition.negotiated_output_version
 ```
 
-For a compiled route:
+The properties let applications use `route.compiler` and `route.device` without dereferencing the definition. Internally, instances reference the shared definition instead of copying compiler and device descriptions.
 
-- `compiler_input` is one entry from `compiler.input_capabilities`.
-- `compiler_output` is one entry from `compiler.output_capabilities`.
-- `device_input` is one entry from `device.accepted_inputs`.
-- `compiler_output.representation == device_input.representation`.
-- `negotiated_output_version` belongs to the intersection of the compiler-output and device-input version sets.
+For a compiled definition, the compiler input and output come from the selected `Compiler`, the device input comes from the selected `Device`, the compiler-output and device-input representations match, and `negotiated_output_version` is one exact version reported by both capabilities. The compiler contract guarantees every advertised input can reach every advertised output.
 
-The compiler contract guarantees that every advertised input capability can be compiled into every advertised output capability. Therefore a route can represent the Cartesian-product edge directly; no separate transformation record is required.
+For an opaque definition, all compiler and format fields are `None`. Its selected instance forwards `Program.payload` unchanged through the device's internal access context.
 
-For an opaque route, `compiler`, `compiler_input`, `compiler_output`, `device_input`, and `negotiated_output_version` are all `None`. libquantum forwards `Program.payload` unchanged through the QPM service and reservation recorded by `device`, with no compiler or format claim.
+`route_id` deterministically identifies the shared definition. `instance_id` uniquely identifies one selected instance within the context. Opening the same definition twice produces equal `route_id` values and unequal `instance_id` values.
 
-`route_id` is a deterministic digest of the compatibility generation, compiler identity/version when present, selected input and output capabilities when present, negotiated output version when present, and the device's allocation, service, reservation, identity, and snapshot generation. It contains no ranking score. A route becomes stale when its compatibility generation differs from the context's current generation.
+`open_route()` binds the compiler callbacks, compiler state, and private `DeviceAccessContext` once. `Context.compile(route, program)` and `Context.run(route, ...)` dispatch through those fixed bindings. `compile()` returns the compiler result unchanged. `run()` extracts the QRI response's `cid`, records the operation against this route, and returns that string as `op_id`; libquantum defines no second identifier. Neither `compile()` nor `run()` repeats route lookup or compatibility analysis.
 
-The route never contains callback objects or initialized compiler state. `Context` uses `route.compiler.info.compiler_id` to locate the live callbacks and state. In the final C design, the route can retain handles or references to immutable compiler/device descriptions while the context owns their storage and runtime state.
+**Future — route-local compiler configuration:** compiler options and pass pipelines are outside SC26. A future selected instance may carry the following configuration. It belongs only to that instance and never mutates the shared definition, compiler representation, or another instance.
+
+```python
+@dataclass(frozen=True)
+class CompilerConfiguration:
+    options: Mapping[str, object] = field(default_factory=dict)
+    passes: tuple[str, ...] = ()
+    fingerprint: str = ""
+
+
+# Future ProgramRoute members; not present in SC26.
+compiler_configuration: CompilerConfiguration | None
+
+def configure_compiler(
+    self,
+    options: Mapping[str, object] | None = None,
+    passes: tuple[str, ...] = (),
+) -> None: ...
+```
+
+A future `Context.compile()` snapshots the instance configuration and passes it to the bound compiler callback. It accepts no per-call compilation options. Opening the definition again creates another independently configurable instance.
+
+Resource refresh does not mutate or revalidate an opened route. The route remains bound to the compiler and QRI path established by `open_route()`.
 
 **Status:** draft
 
 ### Operation Records
 
-The following immutable records define caller constraints, operation options, compilation provenance/results, and the opaque task handle.
+**Requirements:** [LQ-FMT-005](requirements.md#lq-fmt-005), [LQ-OBS-002](requirements.md#lq-obs-002), [LQ-TASK-002](requirements.md#lq-task-002), [LQ-TASK-003](requirements.md#lq-task-003), [LQ-TASK-004](requirements.md#lq-task-004)
+
+The immutable public records define route filters, execution options, and compiler provenance.
 
 ```python
 @dataclass(frozen=True)
@@ -341,15 +531,11 @@ class RouteConstraints:
     route_id: str | None = None
     compiler_id: str | None = None
     device_id: str | None = None
-    qpm_service_id: str | None = None
-    allow_alternatives: bool = False
-
-
-@dataclass(frozen=True)
-class CompilationOptions:
-    """Namespaced values validated against the selected compiler schema."""
-
-    values: Mapping[str, object] = field(default_factory=dict)
+    input_representation: str | None = None
+    input_version: str | None = None
+    output_representation: str | None = None
+    output_version: str | None = None
+    minimum_usable_qubits: int | None = None
 
 
 @dataclass(frozen=True)
@@ -368,34 +554,32 @@ class CompilerProvenance:
     output_representation: Representation
     target_source: str | None
     additional_stages: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class CompilationResult:
-    source: Program
-    route: ProgramRoute
-    payload: object | bytes | str
-    representation: Representation
-    compiler_provenance: CompilerProvenance
-    target_snapshot: object | None
-    diagnostics: tuple[Diagnostic, ...] = ()
-
-
-@dataclass(frozen=True)
-class TaskHandle:
-    """Opaque identifier returned after run() accepts local work."""
-
-    context_id: str
-    task_id: str
 ```
 
-All extensible option maps use namespaced keys and a declared schema. Unknown keys are rejected rather than ignored. `CompilationResult` is an inspection record and is not directly executable in SC26; retaining it supports compilation-only use and the future stored-artifact API.
+`RouteConstraints` filters `list_routes()` and does not configure or select a route. `ExecutionOptions` is passed by `Context.run()` to QRI. Compiler options and passes are future route state.
+
+The context also owns one private mutable record per accepted QRI operation:
+
+```python
+@dataclass
+class _OperationRecord:
+    op_id: str                 # Exact QRI cid.
+    route: ProgramRoute
+    completion_queue: CompletionQueue
+    qpm: object
+    reservation_id: str
+    terminal: bool = False
+```
+
+`run()` adds the record only after QRI accepts the operation and returns `cid`. `status()` and `cancel()` look it up by `op_id`. Consuming its terminal completion marks it terminal. The record is internal bookkeeping and is not a second task handle, local lifecycle, correlation object, or result store.
 
 **Status:** draft
 
 ## Compiler Integration Contract
 
-SC26 uses a static set of Python compiler registrations. Every compiler-facing structure and callback is declared in this contract block.
+**Requirements:** [LQ-CMP-001](requirements.md#lq-cmp-001), [LQ-CMP-002](requirements.md#lq-cmp-002), [LQ-CMP-003](requirements.md#lq-cmp-003), [LQ-CMP-004](requirements.md#lq-cmp-004), [LQ-CMP-005](requirements.md#lq-cmp-005), [LQ-COMP-001](requirements.md#lq-comp-001), [LQ-COMP-002](requirements.md#lq-comp-002), [LQ-COMP-005](requirements.md#lq-comp-005), [LQ-EXT-006](requirements.md#lq-ext-006), [LQ-CON-007](requirements.md#lq-con-007)
+
+Compiler integrations are independently installed plugins discovered from configured directories during `initialize()`. Adding an installed compiler does not require a libquantum source change. Every plugin, registration, compiler-facing structure, and callback is declared in this contract block.
 
 ```python
 @dataclass(frozen=True)
@@ -413,7 +597,31 @@ class CompilerInfo:
     unavailable_reason: str | None
     supported_features: frozenset[str]
     configuration_fingerprint: str
-    option_schema: Mapping[str, object]
+
+
+@dataclass(frozen=True)
+class ObjectTypeRegistration:
+    python_type: type
+    sdk: str
+    sdk_versions: VersionSet
+
+
+class SerializedRepresentationRecognizer(Protocol):
+    def identify(
+        self,
+        value: object | bytes | str,
+    ) -> Representation | None: ...
+
+
+@dataclass(frozen=True)
+class RepresentationRegistry:
+    """Internal registry assembled from all compiler registrations."""
+
+    fingerprint: str
+    object_types: Mapping[type, tuple[ObjectTypeRegistration, ...]]
+    serialized_recognizers: tuple[SerializedRepresentationRecognizer, ...]
+
+    def identify_object(self, value: object) -> Representation | None: ...
 
 
 class InputMode(str, Enum):
@@ -454,7 +662,7 @@ class Compiler:
 class ProgramAnalysis:
     logical_qubits: int | None
     required_features: frozenset[str]
-    complete_for_selection: bool
+    complete_for_route_filtering: bool
     diagnostics: tuple[Diagnostic, ...] = ()
 
 
@@ -463,10 +671,8 @@ class CompatibilityRequest:
     program: Program
     analysis: ProgramAnalysis
     device: Device
-    device_access: DeviceAccessContext
     output_representation: str
     output_version: str
-    options: CompilationOptions
 
 
 @dataclass(frozen=True)
@@ -482,10 +688,8 @@ class CompatibilityReport:
 class CompilerRequest:
     program: Program
     device: Device
-    device_access: DeviceAccessContext
     output_representation: str
     output_version: str
-    options: CompilationOptions
 
 
 @dataclass(frozen=True)
@@ -525,18 +729,72 @@ class CompilerCallbacks(Protocol):
 class CompilerRegistration:
     compiler_id: str
     callbacks: CompilerCallbacks
-    configuration: Mapping[str, object] = field(default_factory=dict)
+    object_types: tuple[ObjectTypeRegistration, ...] = ()
+    serialized_recognizers: tuple[
+        SerializedRepresentationRecognizer, ...
+    ] = ()
+
+
+@dataclass(frozen=True)
+class CompilerPluginManifest:
+    """Validated form of one compiler.json file."""
+
+    schema_version: int
+    compiler_id: str
+    plugin_api_version: int
+    module: str
+    factory: str
+
+
+class CompilerPluginFactory(Protocol):
+    def __call__(self) -> CompilerRegistration: ...
 ```
 
-`InputCapability` and `OutputCapability` preferences are stable nonnegative ranks; lower values are preferred. Native capabilities must rank ahead of converted or non-native capabilities. The integration contract guarantees a full cross-product: every advertised input capability can be compiled into every advertised output capability. An integration that cannot satisfy that invariant must register narrower compiler representations rather than advertise unrelated input and output sets.
+Each installed Python plugin has its own directory and a `compiler.json` manifest beside its implementation. For example:
 
-`initialize()` may allocate compiler-owned state and is called once per context. libquantum calls `describe()`, `input_capabilities()`, and `output_capabilities()` and assembles their results into one immutable `Compiler`. `Context.list_compilers()` returns these representations. Capability callbacks are queried again only after explicit refresh or configuration change. `check_compatibility()` is called for each candidate route and actual program. `compile()` performs any integration-owned input conversion and output serialization; libquantum verifies that its result matches the selected route. `finalize()` must tolerate repeated cleanup after partial initialization.
+```text
+compilers/
+  qiskit/
+    compiler.json
+    plugin.py
+  mqt/
+    compiler.json
+    plugin.py
+```
 
-Callbacks raise or return structured failures that libquantum converts to `LibquantumError` with stable codes. Provider credentials are absent from public callback results. A compiler that needs target data receives the internal `DeviceAccessContext`, preserving allocation, service, reservation, and library identity. `Context` separately retains each registration's callback object and initialized state, keyed by `Compiler.info.compiler_id`; neither is embedded in `Compiler` or `ProgramRoute`.
+The manifest is data, not executable registration code. libquantum validates it into `CompilerPluginManifest` before importing the module. A minimal manifest is:
+
+```json
+{
+  "schema_version": 1,
+  "compiler_id": "qiskit",
+  "plugin_api_version": 1,
+  "module": "plugin",
+  "factory": "create_compiler_registration"
+}
+```
+
+The named factory implements `CompilerPluginFactory` and returns one `CompilerRegistration`. The manifest and returned registration must use the same `compiler_id`. Loading does not depend on module-import side effects or a global registration list. Duplicate compiler identifiers, unsupported manifest or plugin API versions, missing factories, invalid callback objects, and path escapes fail initialization with structured diagnostics.
+
+Discovery searches only the configured compiler directories. `enabled_compilers=None` enables every valid discovered plugin; a set enables only matching identifiers. Unknown enabled identifiers are configuration errors. Search order does not resolve duplicate identifiers, so duplicates fail rather than silently shadowing one another. Compiler directories are deployment-controlled and must not default to the working directory. Plugins are loaded during initialization and remain loaded until their compiler state is finalized. Runtime installation, unloading, or replacement is outside SC26.
+
+The final C implementation keeps the same manifest and lifecycle model. Its loader opens the manifest-selected shared library and resolves a versioned registration symbol such as `lq_compiler_register_v1`; the returned C registration table provides the equivalent callback function pointers and capability queries.
+
+`ObjectTypeRegistration` lets one compiler declare an SDK class and the SDK versions of that class it can ingest. libquantum derives the representation identity as `python:<python_type.__module__>.<python_type.__qualname__>` and verifies that the compiler advertises a matching `InputCapability` covering the registered versions. The registry stores a tuple of registrations for each exact Python type; it does not merge their version sets or require them to be equal. For example, one compiler may register Qiskit `QuantumCircuit` 1.5 and another may register 2.5. Both registrations remain valid, and the application's installed SDK version determines which compiler routes are eligible. A conflict occurs only when registrations assign incompatible SDK identity to the same runtime Python type, not when their supported versions differ. Serialized recognizers are likewise contributed by compilers; their returned representation names and versions must match that compiler's input capabilities. libquantum owns validation and indexing, not the vocabulary of SDK types or formats.
+
+`InputCapability.representation` and `OutputCapability.representation` use the extensible representation identifiers defined by the QRI program-input-capability wire contract. Compiler plugins and QPM providers must use identical identifiers for compatible formats; libquantum performs exact identifier and version-set matching and does not maintain a closed format enum. `InputCapability` and `OutputCapability` preferences are stable nonnegative ranks; lower values are preferred. Native capabilities must rank ahead of converted or non-native capabilities. The integration contract guarantees a full cross-product: every advertised input capability can be compiled into every advertised output capability. An integration that cannot satisfy that invariant must register narrower compiler representations rather than advertise unrelated input and output sets.
+
+`initialize()` may allocate compiler-owned state and is called once per context. libquantum passes the deployment-selected entry from `InitConfig.compiler_configuration` through `CompilerInitContext.configuration`; these are initialization settings, not application compilation options. libquantum calls `describe()`, `input_capabilities()`, and `output_capabilities()`, assembles one immutable `Compiler`, and validates its contributed object types and serialized recognizers against those capabilities. It then builds the context's internal `RepresentationRegistry` from all successful compiler registrations. `Context.list_compilers()` returns these representations. Capability callbacks are queried again only after explicit refresh or configuration change. `check_compatibility()` is called for each candidate definition and actual program. For SC26, `compile()` uses registered/default configuration and performs any integration-owned input conversion and output serialization; the callback result is returned unchanged to the application. `finalize()` must tolerate repeated cleanup after partial initialization.
+
+`CompilerCallbacks` is the compiler dispatch table. `open_route()` binds the selected callback object and initialized state into the route. `Context.compile(route, program)` invokes that bound callback directly and returns `CompilerResult` unchanged. Capability discovery, compatibility analysis, callback lookup, and result verification are not repeated on the opened-route path. Future route-local configuration is snapshotted into the compiler request without mutating shared state.
+
+Control-path callbacks report structured failures during discovery and route query. The bound `compile()` callback returns its compiler-defined result directly. `Context.compile()` translates a callback exception into `LibquantumError` with stage `COMPILATION`. Compiler callbacks receive the normalized allocation-scoped `Device`, not QFw service bindings, reservation identifiers, or authentication state. libquantum collects required target data through its private `DeviceAccessContext` before invoking a callback and records incomplete target data on `Device`. `Context` retains each registration's callback object and initialized state, keyed by `Compiler.info.compiler_id`. `open_route()` binds the selected entries into private `ProgramRoute` state; they are not embedded in the public `Compiler` representation.
 
 **Status:** draft
 
 ## Device Discovery Through QRI
+
+**Requirements:** [LQ-RES-001](requirements.md#lq-res-001), [LQ-RES-002](requirements.md#lq-res-002), [LQ-DEV-001](requirements.md#lq-dev-001), [LQ-DEV-002](requirements.md#lq-dev-002), [LQ-COMP-003](requirements.md#lq-comp-003), [LQ-QFW-003](requirements.md#lq-qfw-003), [LQ-ADAPT-004](requirements.md#lq-adapt-004), [LQ-ADAPT-005](requirements.md#lq-adapt-005), [LQ-FMT-002](requirements.md#lq-fmt-002), [LQ-DEMO-007](requirements.md#lq-demo-007)
 
 Discovery begins with the active QFw resolver/directory context and retains only QPM services belonging to the current allocation and reservation set. For each service, libquantum binds the public execution and telemetry APIs. The result is an immutable `ResourceSnapshot`.
 
@@ -549,32 +807,62 @@ class ResourceSnapshot:
     diagnostics: tuple[Diagnostic, ...] = ()
 ```
 
-At the reviewed QFw revision, device collection uses these telemetry calls.
+libquantum uses the following QPM telemetry operations. They characterize the device or QPM service and are intentionally not reservation-scoped, so they may be queried independently of a particular execution reservation.
 
-| QPM telemetry call | Use in libquantum |
+| Required QPM telemetry call | Use in libquantum |
 | --- | --- |
-| `get_backend_info(lib=None, token=None, reservation_id=None)` | Establish backend/device identity, static architecture, advertised metadata support, and shim library context. |
-| `get_device_info(lib=None, token=None)` | Obtain the qhw device properties and native operation data. |
-| `get_coupling_graph(calibration_set_id=None, lib=None, token=None)` | Obtain topology used by compiler target construction. |
-| `get_calibration_snapshot(calibration_set_id=None, lib=None, token=None)` | Obtain the calibration snapshot and its identity for compiler provenance. |
-| `get_dynamic_backend_info(calibration_set_id=None, lib=None, token=None)` | Optional QRMI-specific dynamic target data when the selected integration requires it. |
-| `capability_map(token=None)` | Verify which QRMI/QDMI library path implements required telemetry calls. |
-| `get_capacity_snapshot(token=None, device_id=None, scope_id=None, access_class=None)` | Obtain current usable capacity and reservation/held-capacity context. |
-| `get_queue_metrics(token=None, device_id=None, access_class=None)` | Future turnaround-time policy only; it is not needed by the SC26 default selector. |
+| `get_backend_info(lib=None)` | Establish backend/device identity, static architecture, advertised metadata support, and shim library context. |
+| `get_device_info(lib=None)` | Obtain the qhw device properties and native operation data. |
+| `get_program_input_capabilities()` | Obtain the authoritative representations and versions accepted by this QPM execution path. |
+| `get_coupling_graph(calibration_set_id=None, lib=None)` | Obtain topology used by compiler target construction. |
+| `get_calibration_snapshot(calibration_set_id=None, lib=None)` | Obtain the calibration snapshot and its identity for compiler provenance. |
+| `get_dynamic_backend_info(calibration_set_id=None, lib=None)` | Optional QRMI-specific dynamic target data when the selected integration requires it. |
+| `capability_map()` | Verify which QRMI/QDMI library path implements required telemetry calls. |
+| `get_capacity_snapshot(device_id=None, scope_id=None, access_class=None)` | Obtain current usable capacity and reservation/held-capacity context. |
+| `get_queue_metrics(device_id=None, access_class=None)` | Future application route policy only; it is not needed for SC26 route filtering. |
 
-Accepted submission formats and versions must come from an authoritative QPM/QRI advertisement. The existing `circuit_formats` and `qpy_version` properties may seed `accepted_inputs`, but a format is included only if the same execution path guarantees it accepts that format. A default property from a generic query helper is insufficient evidence. **TODO:** settle whether QFw extends the current properties or adds a public versioned format-capability call.
+QFw must add the new `get_program_input_capabilities()` service method; it is not present in the reviewed QFw revision. Its result is a versioned QRI wire object, not a serialized libquantum class:
 
-There is an authorization asymmetry in the reviewed telemetry surface: `get_backend_info` accepts `reservation_id`, while the other target calls do not. Initialization records this limitation and marks metadata incomplete when the active identity cannot retrieve the selected device's target data. **TODO:** qualify or extend reservation-scoped access for every target call used by compilation.
+```json
+{
+  "schema_version": 1,
+  "inputs": [
+    {
+      "representation": "openqasm",
+      "versions": ["3.0"],
+      "preference": 0,
+      "native": true
+    }
+  ]
+}
+```
 
-`refresh_resources()` repeats discovery and telemetry collection, compares normalized records, and creates a new resource and compatibility generation when any selection-relevant fact changes. It does not mutate old route objects. Compiler callbacks may retrieve target details through the stored internal access context, but the normalized `Device` remains the common application-facing view.
+`schema_version` versions the response structure. Each `representation` is an extensible lowercase identifier rather than a closed enum; provider-specific identifiers must be namespaced. `versions` lists only the exact versions accepted by the execution path. `preference` is a stable nonnegative rank where zero is most preferred, and `native` indicates that the QPM/provider execution path requires no representation conversion. Unknown additional fields are ignored for forward compatibility; an unsupported schema version or malformed required field rejects the capability response.
+
+The QPM provider integration populates this response from the formats actually accepted by that QPM execution path. The QPM contract guarantees that each advertised representation/version can be submitted through that path. Compiler plugins advertise output capabilities using the same representation-identifier and version semantics. libquantum performs a generic field-by-field translation into `FormatSupport` and exact identifier/version intersection; it contains no per-format conversion table. Existing `circuit_formats`, `qpy_version`, provider defaults, or generic query-helper properties are not authoritative substitutes. If the new method is absent or invalid, libquantum marks device metadata incomplete and does not construct compiled routes for that device.
+
+Device telemetry is separate from reservation-authorized execution. Discovery does not pass a reservation identifier, and absence of an execution reservation does not make device metadata incomplete. Any general service-access policy is enforced by QFw at the RPC/service boundary rather than represented as a libquantum telemetry argument. Submission and QRI completion-event registration remain reservation-scoped through the execution API.
+
+`refresh_resources()` repeats discovery and telemetry collection, compares normalized records, and creates a new resource and compatibility generation when any selection-relevant fact changes. It does not mutate old route objects. libquantum retrieves target details through the stored internal access context and supplies the normalized `Device` to compiler callbacks and applications; compiler integrations do not receive QFw bindings.
 
 **Status:** draft
 
 ## Initialization and Finalization
 
-The lifecycle API uses closed context/finalization states and an immutable result record.
+**Requirements:** [LQ-INIT-001](requirements.md#lq-init-001), [LQ-INIT-002](requirements.md#lq-init-002), [LQ-INIT-003](requirements.md#lq-init-003), [LQ-INIT-004](requirements.md#lq-init-004), [LQ-FIN-001](requirements.md#lq-fin-001), [LQ-FIN-003](requirements.md#lq-fin-003), [LQ-FIN-004](requirements.md#lq-fin-004), [LQ-QFW-001](requirements.md#lq-qfw-001), [LQ-QFW-006](requirements.md#lq-qfw-006), [LQ-CON-001](requirements.md#lq-con-001), [LQ-CON-006](requirements.md#lq-con-006), [LQ-ENV-002](requirements.md#lq-env-002), [LQ-ENV-003](requirements.md#lq-env-003), [LQ-ADAPT-001](requirements.md#lq-adapt-001), [LQ-ADAPT-002](requirements.md#lq-adapt-002), [LQ-ADAPT-003](requirements.md#lq-adapt-003), [LQ-CQ-007](requirements.md#lq-cq-007)
+
+The lifecycle API uses an immutable initialization record, closed context and finalization states, and an immutable finalization result.
 
 ```python
+@dataclass(frozen=True)
+class InitConfig:
+    compiler_paths: tuple[str, ...] = ()
+    enabled_compilers: frozenset[str] | None = None
+    compiler_configuration: Mapping[
+        str, Mapping[str, object]
+    ] = field(default_factory=dict)
+
+
 class ContextState(str, Enum):
     INITIALIZING = "initializing"
     READY = "ready"
@@ -591,38 +879,49 @@ class FinalizeStatus(str, Enum):
 @dataclass(frozen=True)
 class FinalizeResult:
     status: FinalizeStatus
-    unfinished_tasks: tuple[TaskHandle, ...] = ()
+    outstanding_op_ids: tuple[str, ...] = ()
     diagnostics: tuple[Diagnostic, ...] = ()
 ```
 
+`compiler_paths` lists the trusted directories searched for installed compiler manifests. An empty tuple selects deployment-configured defaults, never the process working directory. `enabled_compilers=None` loads every valid discovered compiler; a set loads only the listed identifiers. Unknown identifiers are initialization errors. `compiler_configuration` supplies compiler-specific initialization settings. It does not configure route selection or per-program compilation. Direct `CompilerRegistration` injection is reserved for tests.
+
+qfw-slurm exports `QFW_RESERVATIONS` into the application environment before the process starts. libquantum consumes it as read-only input and never sets or modifies it. The value is the QFw-defined JSON list of `[service_id, reservation_id]` pairs. Service identifiers are unique non-empty strings. Reservation identifiers are decimal strings from 1 through `UINT64_MAX`. Initialization uses the QFw reservation parser and validation behavior, retains every pair, and resolves each exact service through the active QFw directory. libquantum does not create, extend, release, or otherwise manage these reservations.
+
 `initialize()` performs these steps in order.
 
-1. Read the active QFw runtime, allocation, reservation set, resolver scope, and credentials/token context. Generate a context identity.
-2. Resolve allocation-visible QPM services and bind each service's public execution and telemetry APIs.
-3. Register configured compiler integrations. Call `initialize()`, then collect identity, input, output, option, and feature capabilities.
-4. Build the allocation-scoped `ResourceSnapshot` through the QRI calls in this design.
-5. Build the compatibility mapping and its generation identifier.
-6. Create the local task registry and completion dispatcher. Register QPM event notification for reservation scopes owned by this context; retain every registration identifier for cleanup.
-7. Change the context state to `READY`. Lazy compiler or service connections are allowed only when their absence does not prevent route enumeration.
+1. Validate `InitConfig`, parse the qfw-slurm-provided `QFW_RESERVATIONS` value, read the active resolver scope, and generate a context identity.
+2. Resolve every `[service_id, reservation_id]` pair and bind that service's public execution and telemetry APIs. Create one internal `DeviceAccessContext` per discovered device.
+3. Search the configured compiler directories for `compiler.json`, validate every discovered manifest, and apply `enabled_compilers`. Reject unknown enabled identifiers and duplicate discovered compiler identifiers.
+4. Load each enabled plugin module, resolve its factory, and validate the returned `CompilerRegistration`. Call its `initialize()` callback with the compiler-specific configuration, then collect identity, input/output capabilities, contributed object types, serialized recognizers, and feature capabilities.
+5. Validate each contributed object type and version set against its compiler's input capabilities and assemble the context's internal `RepresentationRegistry`. Retain independent versioned registrations for the same exact Python type; reject only incompatible SDK identity for that runtime type.
+6. Build the allocation-scoped `ResourceSnapshot` through the QRI calls in this design.
+7. Build the compatibility mapping and its generation identifier.
+8. Initialize QRI event support used by `CompletionQueue`. `Context.create_completion_queue(route)` creates a `BaseEventAPI`, registers it through the route's bound QPM, and retains the returned registration for cleanup.
+9. Change the context state to `READY`. Lazy compiler or service connections are allowed only when their absence does not prevent route enumeration.
 
-A failure reports the step, service/compiler identity, and structured cause. Initialization unwinds completed steps in reverse order and unregisters any listener already created. It never creates or releases the external allocation or reservation.
+**Implementation note — QFw Backend reference and parallel path:** before implementing these lifecycle steps, review the existing implementations under `QFw/backends`. They are the behavioral reference for QFw runtime discovery, reservation and service resolution, execution/telemetry binding, device-to-target construction, payload preparation, submission, and completion-event handling. Reuse or extract the existing lower-level helpers where their contracts match instead of creating a second interpretation of QFw behavior. libquantum must still implement its own `Context`, route query/open, compiler integration, and completion-queue contracts; it must not make `QFwBackend` its internal architecture.
+
+The existing QFw Backend and libquantum remain separate, supported application APIs. The application developer chooses one in application code: construct and use the QFw Backend, or call `libquantum.initialize()` and use the libquantum API. There is no shared path selector, deployment-time path-selection mechanism, automatic fallback, adapter, or cross-path retry in libquantum or in this design. Continuing through QFw Backend when libquantum is unsuitable requires the application to run its explicitly implemented QFw Backend code path. Neither API depends on the other. Changes to shared lower-level helpers must preserve the existing backend behavior while libquantum is qualified.
+
+A failure reports the step, service/compiler identity, and structured cause. Initialization unwinds completed steps in reverse order and unregisters any listener already created. It never creates or releases the external allocation or reservation. Reservation creation has already associated the authenticated allocation owner with provider access inside QPM. libquantum joins that reservation and does not recreate or carry the association.
 
 `finalize(context, timeout)` is idempotent and performs these steps.
 
-1. Atomically change `READY` to `FINALIZING` so new compile and run operations are rejected.
-2. Allow accepted local selection/compilation/submission work and submitted QPM tasks to reach terminal handling until `timeout`.
-3. Drain already received terminal events into their assigned queues. Normal finalization does not implicitly cancel work; callers use `cancel()` when cancellation is desired.
-4. If the timeout expires, return `FinalizeStatus.TIMED_OUT` with every unfinished handle, retain bindings required for status/cancel/retry, and remain `FINALIZING`.
-5. Once no required work remains, unregister event notifications, close library-owned dispatcher resources and queues, finalize compiler integrations in reverse order, release library-owned connections, and enter `FINALIZED`.
-6. A later call returns `ALREADY_FINALIZED` without repeating remote effects.
+1. Atomically change `READY` to `FINALIZING` so no new compiler or QRI operation starts.
+2. Wait until every internally tracked operation is terminal or `timeout` expires. Check nonterminal operations through the owning QPM's `task_status`; do not consume an application's completion merely to test status.
+3. If the timeout expires, emit a diagnostic listing every outstanding `op_id`, return `FinalizeResult(status=TIMED_OUT, outstanding_op_ids=...)`, and continue cleanup without claiming completion or cancellation.
+4. Unregister QRI endpoints, close library-owned `BaseEventAPI` resources, finalize compiler integrations in reverse order, and release library-owned connections.
+5. Enter `FINALIZED`; a later call returns `ALREADY_FINALIZED`.
 
-A disconnected service or unsupported cancellation produces an unknown task outcome; neither case is reported as confirmed cancellation. Finalization never shuts down a shared QPM or releases launcher-owned allocation/reservation state.
+Finalization never implicitly calls `cancel()`, shuts down a shared QPM, or releases launcher-owned allocation/reservation state. Applications request cancellation explicitly before finalization when desired.
 
 **Status:** draft
 
 ## Compatibility Mapping
 
-The compatibility map and route-query response are immutable records. The map has indexes for all routes, compiler inputs, devices, and opaque forwarding routes. It is rebuilt rather than patched in place.
+**Requirements:** [LQ-COMP-004](requirements.md#lq-comp-004), [LQ-COMP-005](requirements.md#lq-comp-005), [LQ-COMP-008](requirements.md#lq-comp-008), [LQ-CON-002](requirements.md#lq-con-002), [LQ-FMT-003](requirements.md#lq-fmt-003), [LQ-FMT-004](requirements.md#lq-fmt-004)
+
+The compatibility map contains immutable available routes built during `initialize()` from cached compiler capabilities and device input capabilities. `refresh_resources()` rebuilds the map; later route operations do not repeat the cross-product.
 
 ```python
 @dataclass(frozen=True)
@@ -636,7 +935,7 @@ class RejectedRoute:
 @dataclass(frozen=True)
 class CompatibilityMap:
     generation: str
-    routes_by_id: Mapping[str, ProgramRoute]
+    routes_by_id: Mapping[str, AvailableRoute]
     routes_by_input: Mapping[tuple[str, str], tuple[str, ...]]
     routes_by_device: Mapping[str, tuple[str, ...]]
     opaque_routes: tuple[str, ...]
@@ -645,230 +944,122 @@ class CompatibilityMap:
 @dataclass(frozen=True)
 class RouteQueryResult:
     compatibility_generation: str
-    routes: tuple[ProgramRoute, ...]
+    routes: tuple[AvailableRoute, ...]
     rejected: tuple[RejectedRoute, ...] = ()
 ```
 
-Compiled routes are built from the declared cross-product.
+Map construction uses the cached declarations.
 
-1. For every assembled `Compiler`, iterate over each `compiler.input_capabilities` entry and each `compiler.output_capabilities` entry.
-2. For every allocated `Device`, compare the compiler output with each entry in `device.accepted_inputs`.
-3. Continue only when the compiler output and device input have the same representation and their version sets intersect.
-4. For each concrete negotiated version in the intersection, create one `ProgramRoute` referencing the compiler input, compiler output, device, and device input records and recording the negotiated output version.
-5. Index the route under every concrete input version represented by `compiler_input.versions`, and under `device.device_id`.
-6. Compute `route_id` from the selected capabilities, negotiated output version, compiler, device/service/reservation, snapshot, and compatibility generation.
+1. Compare each compiler output with each allocated device input.
+2. Keep exact representation matches and exact versions reported by both.
+3. Create one `AvailableRoute` per matching compiler input, compiler output, device input, and output version.
+4. Index the route by each exact reported compiler-input version and by device.
+5. Derive `route_id` from that mapping, the device snapshot, execution access, and generation.
 
-For example, a compiler advertising QPY input and OpenQASM 3 output creates a QPY-to-OpenQASM-3 route to an IQM device only when that device advertises a compatible OpenQASM 3 input version. A device's higher-preference JSON input produces no route unless the compiler also advertises compatible JSON output.
+No version range or unreported version is inferred.
 
-Opaque routes are constructed separately. Each allocation-visible `Device` that permits the existing opaque forwarding contract receives one `ProgramRoute` with all compiler and format fields set to `None`. It appears in `routes_by_id`, `routes_by_device`, and `opaque_routes`, but never in `routes_by_input`. The opaque route asserts only that the device's QPM service/reservation is authorized and reachable; the receiving QPM validates the payload.
+Opaque definitions are constructed separately with compiler and format fields set to `None`; they are indexed by route and device but not input.
 
-The startup map establishes structural compatibility only. A recognized program query runs the referenced compiler's `analyze()` and `check_compatibility()` callbacks because program constructs, options, usable capacity, target completeness, or reservation limits can reject a structurally valid route. `list_routes(..., explain=True)` populates `rejected`; otherwise it may leave that tuple empty.
+The map establishes structural compatibility only. Program queries perform the remaining program-specific analysis, capacity, target-completeness, and compatibility checks. `list_routes()` returns these definitions and never creates selected instances.
 
-A mapping generation fingerprints compiler identity/version/configuration and ordered capabilities, device snapshot generations and ordered accepted inputs, QPM service/reservation identity, opaque-forwarding availability, and the representation registry version. A caller cannot select, compile, or run with a stale route; it must query/select again against the current generation.
+The generation fingerprints compiler registrations/capabilities, the compiler-contributed representation-registry fingerprint, device snapshots/inputs, execution access, and opaque forwarding. Refresh does not modify opened routes. A later query and `open_route()` call uses the new generation; existing routes keep their bound dispatch.
 
 **Status:** draft
 
 ## Route Selection
 
-Selection is a pure operation over one compatibility generation. Its result and policy evidence are immutable records.
+**Requirements:** [LQ-COMP-005](requirements.md#lq-comp-005), [LQ-COMP-006](requirements.md#lq-comp-006), [LQ-COMP-007](requirements.md#lq-comp-007), [LQ-SEL-001](requirements.md#lq-sel-001), [LQ-SEL-002](requirements.md#lq-sel-002), [LQ-SEL-003](requirements.md#lq-sel-003), [LQ-SEL-008](requirements.md#lq-sel-008), [LQ-DEMO-006](requirements.md#lq-demo-006)
 
-```python
-@dataclass(frozen=True)
-class PolicyValue:
-    policy: str
-    value: object
-    explanation: str
+libquantum filters routes; the application chooses among the eligible definitions.
 
+1. `list_routes()` starts from the cached compatibility map.
+2. If a program is supplied, retain definitions accepting its exact representation and version, then run program analysis, compatibility, and capacity checks.
+3. Apply `RouteConstraints` as filters for route, compiler, device, input, output, version, and minimum capacity.
+4. Return every eligible `AvailableRoute`; when `explain=True`, also return rejected definitions and reasons.
+5. The application applies its own policy and passes one definition to `open_route()`.
+6. `open_route()` validates context ownership and generation, then creates a fresh `ProgramRoute` for that exact definition.
 
-@dataclass(frozen=True)
-class SelectionResult:
-    program_representation: Representation
-    route: ProgramRoute
-    effective_constraints: RouteConstraints
-    policy_values: tuple[PolicyValue, ...]
-    compatibility_generation: str
-    reasons: tuple[str, ...]
-```
+Returned order is deterministic by `route_id` and conveys no preference. libquantum does not score candidates or choose a winner. Capability preference, native-format indicators, device capacity, topology, and future metrics remain visible for application policy.
 
-Recognized programs perform eligibility checks before preferences.
-
-1. Start from `routes_by_input` and retain routes whose `compiler_input.representation` and `compiler_input.versions` accept the imported program's representation and version.
-2. Apply an explicit `route_id`, `compiler_id`, `device_id`, or `qpm_service_id` as a hard constraint. Compiler constraints compare `route.compiler.info.compiler_id`; device and service constraints compare fields on `route.device`. An incompatible explicit choice fails unless `allow_alternatives=True` was explicitly set.
-3. Reject routes missing compiled capability fields, whose compiler is unavailable, whose compatibility callback rejects the program/options, whose selected output/device-input versions no longer agree, whose target metadata is insufficient, or whose `device.capacity.usable_qubits` is below the analyzed requirement.
-4. Rank the remaining routes with the SC26 policy tuple below. The lowest tuple wins.
-
-```text
-(
-  device usable-qubit capacity,             # smallest sufficient device first
-  compiler_input.preference,                # native inputs rank first
-  device_input.preference,                  # device-native formats rank first
-  compiler_output.preference,               # compiler-native outputs rank first
-  device-specific compiler priority,
-  global compiler priority,
-  route_id                                   # stable deterministic tie break
-)
-```
-
-Capability integrations must rank native support ahead of converted/non-native support, so the explicit preference values implement the native-format policies while retaining a deterministic order among capabilities of the same class. An explicit device removes device-size comparison among other devices; an explicit compiler removes compiler-priority comparison among other compilers. Device-specific compiler priority overrides global priority only for that device. Missing priorities sort after configured entries. `policy_values` records the winning rank components; `reasons` summarizes eligibility and the deterministic tie break.
-
-Opaque programs use only routes whose compiler and format fields are absent. The caller must supply a `route_id` or device/service constraints that resolve to exactly one opaque route. A compiler constraint is invalid for an opaque program. libquantum does not rank opaque destinations or infer payload compatibility; zero matches produce `NO_OPAQUE_ROUTE`, and multiple matches produce `AMBIGUOUS_OPAQUE_ROUTE`.
-
-Trial-compilation metrics, execution-quality estimates, turnaround time, affinity, and graph distribution policies are deferred. Selection never changes the chosen route after QPM acceptance or after an uncertain submission outcome.
+Opaque definitions use the same query-and-open flow. They must match an opaque program and bypass compiler callbacks and serialization. Required device features, trial metrics, affinity, graph distribution, and a dedicated explanation API are future.
 
 **Status:** draft
 
 ## Compilation and Execution
 
-Compilation is synchronous; execution is represented by a stateful task whose public view is an immutable `TaskStatus`.
+**Requirements:** [LQ-PRG-004](requirements.md#lq-prg-004), [LQ-COMP-008](requirements.md#lq-comp-008), [LQ-COMP-009](requirements.md#lq-comp-009), [LQ-TASK-001](requirements.md#lq-task-001), [LQ-TASK-002](requirements.md#lq-task-002), [LQ-TASK-003](requirements.md#lq-task-003), [LQ-TASK-004](requirements.md#lq-task-004), [LQ-TASK-005](requirements.md#lq-task-005), [LQ-QFW-002](requirements.md#lq-qfw-002), [LQ-QFW-005](requirements.md#lq-qfw-005), [LQ-ENV-007](requirements.md#lq-env-007), [LQ-FMT-005](requirements.md#lq-fmt-005), [LQ-FMT-006](requirements.md#lq-fmt-006), [LQ-ADAPT-006](requirements.md#lq-adapt-006), [LQ-ADAPT-008](requirements.md#lq-adapt-008), [LQ-CON-002](requirements.md#lq-con-002)
 
-```python
-class TaskPhase(str, Enum):
-    SELECTING = "selecting"
-    COMPILING = "compiling"
-    SUBMITTING = "submitting"
-    REMOTE = "remote"
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-    TIMED_OUT = "timed_out"
-    CANCELLATION_REQUESTED = "cancellation_requested"
-    CANCELLED = "cancelled"
-    OUTCOME_UNKNOWN = "outcome_unknown"
+An opened `ProgramRoute` carries the compiler and QRI bindings chosen by the application. Compilation and submission are separate operations.
 
+`Context.compile(route, program)` invokes the bound compiler callback with its initialized state and selected device target and returns `CompilerResult` unchanged. It performs no QRI submission. Opaque routes have no compile dispatch.
 
-@dataclass(frozen=True)
-class RemoteTaskIdentity:
-    qpm_service_id: str
-    reservation_id: str
-    circuit_id: str | None
-    qpm_task_id: str | None
-    scheduler_task_id: str | None
+`Context.run(route, executable, completion_queue, execution_options)` performs only submission:
 
+1. Validate that the route and queue belong to this context and that the queue is registered for the same route.
+2. Prepare the existing QFw payload from `CompilerResult.payload`, or forward `Program.payload` unchanged for an opaque route.
+3. Call the bound QRI/QPM `async_run` with the route reservation, queue registration, and execution options.
+4. Extract and validate `cid` from the accepted response.
+5. Store `_OperationRecord` keyed by that exact `cid` and return it as `op_id`.
 
-@dataclass(frozen=True)
-class TaskStatus:
-    task: TaskHandle
-    phase: TaskPhase
-    route: ProgramRoute | None
-    remote: RemoteTaskIdentity | None
-    terminal: bool
-    diagnostics: tuple[Diagnostic, ...] = ()
+`run()` does not select a route, invoke a compiler, expose the QRI submission mapping, create another identifier, or maintain a parallel remote state machine. An immediate submission failure raises `LibquantumError` and creates no operation record.
 
+`Context.status(op_id)` finds the operation record and calls the bound QPM's `task_status(cid=op_id, reservation_id=...)`. It returns the QPM status mapping unchanged. `Context.cancel(op_id)` similarly calls `cancel_task`. A cancellation request is not reported as confirmed until QPM reports a terminal cancelled outcome. Unknown or cross-context IDs fail locally.
 
-class CancellationState(str, Enum):
-    REQUESTED = "requested"
-    CONFIRMED = "confirmed"
-    UNSUPPORTED = "unsupported"
-    OUTCOME_UNKNOWN = "outcome_unknown"
-    ALREADY_TERMINAL = "already_terminal"
-
-
-@dataclass(frozen=True)
-class CancellationResult:
-    task: TaskHandle
-    state: CancellationState
-    status: TaskStatus
-```
-
-`compile()` accepts only a recognized program and a route with non-null compiler, compiler-input, compiler-output, device-input, and negotiated-output-version fields. It validates the context and route generation, verifies that the program matches `route.compiler_input`, locates the live callbacks and initialized state through `route.compiler.info.compiler_id`, invokes `compile()` with the original program and `route.device` access context, and verifies the returned representation/version against `route.compiler_output.representation` and `route.negotiated_output_version`. It returns `CompilationResult` and performs no QPM execution call. Passing an opaque program or opaque route raises `OPAQUE_NOT_COMPILABLE`.
-
-`run()` accepts a local task before work begins. It allocates `task_id`, atomically pairs it with the selected completion queue and correlation data, stores a source-program reference, and schedules this phase machine:
-
-```mermaid
-stateDiagram-v2
-  [*] --> SELECTING
-  SELECTING --> COMPILING: compiled route
-  SELECTING --> SUBMITTING: opaque route
-  COMPILING --> SUBMITTING
-  SUBMITTING --> REMOTE: QPM async_run accepted
-  REMOTE --> SUCCEEDED
-  REMOTE --> FAILED
-  REMOTE --> TIMED_OUT
-  REMOTE --> CANCELLED
-  SELECTING --> FAILED
-  COMPILING --> FAILED
-  SUBMITTING --> FAILED
-  SELECTING --> CANCELLED
-  COMPILING --> CANCELLED
-  FAILED --> COMPLETION_PUBLISHED
-  TIMED_OUT --> COMPLETION_PUBLISHED
-  CANCELLED --> COMPLETION_PUBLISHED
-  SUCCEEDED --> COMPLETION_PUBLISHED
-```
-
-For a compiled route, libquantum invokes the callbacks associated with `route.compiler`, verifies the result against `route.compiler_output.representation` and `route.negotiated_output_version`, serializes it with the existing QFw payload mechanism, and submits it through the QPM service and reservation recorded by `route.device`. For an opaque route, libquantum skips compiler callbacks and serialization and submits `Program.payload` unchanged through the QPM service and reservation recorded by `route.device`. In both cases submission calls `QPMExecution.async_run(info, reservation_id, token, timeout, cancel_on_timeout=False)`, carries execution options and correlation/trace context, and records returned remote identifiers before reporting `TaskPhase.REMOTE`.
-
-`task_status()` reports local phases through submission. After QPM acceptance it calls `QPMExecution.task_status(cid, reservation_id, token, qtask_id)` on the owning path; QPM remains authoritative. Optional diagnosis calls `get_task_metadata()` and `get_task_timing()` on that path. `cancel()` stops local work or calls `cancel_task(cid, reservation_id, token, reason, qtask_id)`. A request is not confirmed until QPM reports it.
-
-An opaque program must use a route whose compiler and format fields are absent, and a recognized program must use a route where all of them are present. A mismatched program/route pair fails before submission. Both paths receive a local task, status, cancellation, and exactly one terminal completion.
+The completion event carries the same QRI `cid`. `CompletionQueue.get()` exposes it as `Completion.op_id` and marks the tracked operation terminal. Successful payloads remain unchanged. Resource refresh does not alter submitted operations or opened routes.
 
 **Status:** draft
 
 ## Completion Queues
 
-A completion queue is a stateful application-facing class associated with exactly one context. Any number of independent tasks may share it; each task is paired with exactly one queue when `run()` accepts the task, and that pairing is immutable. `Completion` is an immutable value record. `QhwData` is the existing external qhw-data result type rather than a libquantum-defined structure.
+**Requirements:** [LQ-CQ-001](requirements.md#lq-cq-001), [LQ-CQ-002](requirements.md#lq-cq-002), [LQ-CQ-003](requirements.md#lq-cq-003), [LQ-CQ-004](requirements.md#lq-cq-004), [LQ-CQ-005](requirements.md#lq-cq-005), [LQ-CQ-006](requirements.md#lq-cq-006), [LQ-CQ-007](requirements.md#lq-cq-007), [LQ-RSLT-001](requirements.md#lq-rslt-001), [LQ-TASK-005](requirements.md#lq-task-005)
+
+A completion queue is a thin wrapper around one QRI/DEFw `BaseEventAPI` endpoint registered through an opened route.
 
 ```python
-class CompletionOutcome(str, Enum):
-    SUCCEEDED = "succeeded"
-    FAILED = "failed"
-    TIMED_OUT = "timed_out"
-    CANCELLED = "cancelled"
-
-
 @dataclass(frozen=True)
 class Completion:
-    task: TaskHandle
-    correlation: CorrelationData | None
-    outcome: CompletionOutcome
-    result: QhwData | None
-    error: ErrorDetail | None
-    route: ProgramRoute | None
-    remote: RemoteTaskIdentity | None
+    op_id: str
+    result: object | None = None
+    error: "LibquantumError | None" = None
 
 
 class CompletionQueue:
-    """Stateful FIFO handle; storage and synchronization are context-owned."""
-
     @property
-    def queue_id(self) -> str: ...
+    def event_api(self) -> BaseEventAPI: ...
 
-    def wait(self, timeout: float | None = None) -> bool:
-        """Wait for availability without consuming a completion."""
-        ...
-
-    def peek(self) -> Completion | None:
-        """Inspect the next completion without consuming it."""
-        ...
-
-    def get(self) -> Completion | None:
-        """Consume the next completion immediately, or return None."""
-        ...
-
+    def fileno(self) -> int: ...
+    def wait(self, timeout: float | None = None) -> bool: ...
+    def get(self) -> tuple[Completion, ...]: ...
     def close(self) -> None: ...
 ```
 
-`wait()` returns `False` on caller timeout and changes neither task state nor queue contents. `peek()` and `get()` are nonblocking. A queue cannot be closed while paired nonterminal tasks exist; finalization closes queues after their tasks are resolved. Consuming a successful completion transfers ownership of its unmodified `QhwData` result to the application.
+`create_completion_queue(route)` creates the endpoint, registers it with that route's QPM, and stores the returned registration. `run()` supplies this registration so QRI/QPM delivers the operation's terminal event directly to the selected endpoint. libquantum does not receive events centrally or redistribute them.
 
-The context maintains `task_id -> queue_id`, `(qpm_service_id, reservation_id, circuit_id/qpm_task_id) -> task_id`, and `task_id -> terminal_publication` tables. It registers QPM event notification with reservation and task filters when supported, then uses `peek_cq`/`read_cq` only for records owned by this context. Every event is validated against the owning service and reservation. The first terminal event atomically records the terminal outcome and enqueues one `Completion`; duplicates and late contradictory events are retained as diagnostics and cannot replace the published outcome. Listener registration identifiers are unregistered during successful finalization.
+`wait()` waits for endpoint readability without consuming events or changing QPM status. Timeout returns `False`.
 
-Asynchronous failures store `ErrorDetail`, not an exception object, in the completion. Local selection, compilation, or submission failure also publishes one terminal completion because `run()` already accepted a local task. A direct synchronous `compile()` failure does not use a completion queue.
+`get()` reads each available event, extracts QRI `cid` as `op_id`, preserves a successful payload unchanged, translates an operation failure into that completion's `error`, and marks the matching internal operation record terminal. It does not add application correlation metadata or a second deduplication/reconciliation layer. QRI/QPM is responsible for terminal event production; applications correlate using the `op_id` returned by `run()`.
+
+An endpoint operation failure is raised with stage `COMPLETION`. `close()` unregisters the route's QPM event registration and releases local resources. Closing a queue does not cancel its operations.
 
 **Status:** draft
 
 ## Errors, Results, and Provenance
 
-Synchronous APIs raise `LibquantumError`, a normal exception containing immutable structured detail. Asynchronous failures place the same exception detail on the terminal `Completion`.
+**Requirements:** [LQ-DEV-003](requirements.md#lq-dev-003), [LQ-OBS-001](requirements.md#lq-obs-001), [LQ-OBS-002](requirements.md#lq-obs-002), [LQ-OBS-004](requirements.md#lq-obs-004), [LQ-OBS-005](requirements.md#lq-obs-005)
+
+libquantum presents one public exception contract. Synchronous failures observed at a public boundary become `LibquantumError`.
 
 ```python
 class ErrorStage(str, Enum):
     INITIALIZATION = "initialization"
     DISCOVERY = "discovery"
     PROGRAM_IMPORT = "program_import"
-    SELECTION = "selection"
+    ROUTE = "route"
     COMPILATION = "compilation"
-    SUBMISSION = "submission"
     EXECUTION = "execution"
+    STATUS = "status"
     CANCELLATION = "cancellation"
+    COMPLETION = "completion"
     FINALIZATION = "finalization"
 
 
@@ -878,11 +1069,9 @@ class ErrorDetail:
     code: str
     message: str
     diagnostics: tuple[Diagnostic, ...] = ()
-    task: TaskHandle | None = None
-    correlation: CorrelationData | None = None
     route: ProgramRoute | None = None
+    op_id: str | None = None
     requested_constraints: RouteConstraints | None = None
-    remote: RemoteTaskIdentity | None = None
 
 
 class LibquantumError(Exception):
@@ -891,82 +1080,37 @@ class LibquantumError(Exception):
         super().__init__(detail.message)
 ```
 
-Normal diagnostics omit tokens, credentials, and provider secrets. QPM result payloads remain the external `QhwData` type; libquantum does not convert or interpret them. Completion provenance identifies the original representation and SDK when known, compiler identity/version or explicit compiler bypass, target snapshot, selected route, QPM service/reservation, and remote task. Trace context is forwarded through QFw rather than replaced. Missing calibration, provider timing, or trace fields remain absent and are not fabricated.
+The translation layer maps recognized QFw/DEFw categories to stable codes. Unknown failures use a safe stage-specific underlying-service code. Public details retain route and `op_id` when available but exclude authentication material, server tracebacks, service objects, and original exception types.
 
-The SC26 implementation retains provenance in task and completion records long enough for normal inspection. A separate telemetry database, result-transformation pipeline, and application result processors are deferred.
+Discovery, registration, compilation, submission, status, cancellation, waiting, retrieval, cleanup, and finalization failures are translated at their public boundary. A QPM-reported asynchronous operation failure is stored only in that operation's `Completion.error`; one failure cannot hide other completions in the same batch.
 
-**Status:** draft
-
-## SC26 Runtime and Qualification Boundary
-
-The SC26 implementation is Python and joins the runtime prepared by `qfw-activate`, `qfw-setup`, and `qfw-srun`. Initialization configuration and the representation-recognition contract have explicit Python forms.
-
-```python
-class RepresentationRecognizer(Protocol):
-    def identify(
-        self,
-        value: object | bytes | str,
-    ) -> Representation | None: ...
-
-
-@dataclass(frozen=True)
-class RepresentationRegistry:
-    version: str
-    recognizers: tuple[RepresentationRecognizer, ...]
-
-
-@dataclass(frozen=True)
-class InitConfig:
-    compilers: tuple[CompilerRegistration, ...]
-    compiler_priority: tuple[str, ...] = ()
-    device_compiler_priority: Mapping[str, tuple[str, ...]] = field(
-        default_factory=dict
-    )
-    representation_registry: RepresentationRegistry | None = None
-```
-
-`initialize()` reads `QFW_RESERVATIONS` as a JSON list of `[service_id, reservation_id]` pairs, retains every authorized pair, normalizes decimal-string reservation identifiers at service boundaries, and resolves each pair through the active QFw directory scope. A legacy single reservation value is not allowed to collapse a multi-service allocation. Runtime location, directory scope, reservation identity, and QPM bindings come from QFw rather than `InitConfig`. Credentials remain in QFw-owned contexts.
-
-The implementation reuses QFw telemetry-to-target conversion helpers through a backend-independent boundary and reuses `util.circuit_payload` for serialization; it does not construct `QFwBackend` or introduce another wire envelope, reservation protocol, service plane, scheduler, credential store, or telemetry database.
-
-The demonstration snapshot must record QFw and cluster commits, included PR commits, Python and dependency versions, compiler identities/versions, representation registry version, selected input/output formats, device/service/reservation identities, site configuration identity, and whether each result came from physical hardware, a mock, or a simulator. Readiness requires both IBM and IQM to appear in one allocation with their actual usable capacity; multiple `shim` services remain distinct by service and device identity. Each qualified compiler must produce a payload accepted by its selected QPM, with parameter values, compilation options, layout, and any QFw-side recompilation recorded.
-
-The runnable route set must include Qiskit, MQT Core, and Catalyst integrations with visible availability and at least one qualified QRI route per compiler. Catalyst remains a failed readiness gate until a compiled artifact is submitted through QRI and receives managed QPM task/result semantics; direct submission to `catalyst-executor` does not qualify. Physical IBM and IQM execution, multiple completion queues, shared-queue correlation, duplicate suppression, failure, cancellation, caller wait timeout, and listener cleanup are required deployment evidence rather than new API concepts.
-
-Graph APIs, classical graph nodes, stored-artifact execution, advanced policies, result transformation/circuit cutting, native C interfaces, pass composition, and public plugin loading remain deferred. libquantum does not infer algorithms, bind one task's result into another task, replace compiler/provider internals, implement admission or scheduling, or claim conversion between unrelated gate, analog, hybrid, and runtime program families.
+`CompilerResult`, QPM status/cancellation mappings, and successful QRI completion payloads are preserved unchanged. Missing compiler, provider, timing, or trace fields remain absent.
 
 **Status:** draft
 
-## Requirements Coverage and Open Work
+## Future Requirements
 
-The design is ordered by the public constructs applications and integrations use. It covers the requirements sections as follows.
+**Future requirements:** [LQ-PRG-006](requirements.md#lq-prg-006), [LQ-PRG-009](requirements.md#lq-prg-009), [LQ-SEL-004](requirements.md#lq-sel-004), [LQ-SEL-005](requirements.md#lq-sel-005), [LQ-SEL-006](requirements.md#lq-sel-006), [LQ-SEL-007](requirements.md#lq-sel-007), [LQ-POL-001](requirements.md#lq-pol-001), [LQ-POL-002](requirements.md#lq-pol-002), [LQ-POL-003](requirements.md#lq-pol-003), [LQ-POL-004](requirements.md#lq-pol-004), [LQ-POL-005](requirements.md#lq-pol-005), [LQ-POL-006](requirements.md#lq-pol-006), [LQ-POL-007](requirements.md#lq-pol-007), [LQ-POL-008](requirements.md#lq-pol-008), [LQ-GRF-001](requirements.md#lq-grf-001), [LQ-GRF-002](requirements.md#lq-grf-002), [LQ-GRF-003](requirements.md#lq-grf-003), [LQ-GRF-004](requirements.md#lq-grf-004), [LQ-EXE-001](requirements.md#lq-exe-001), [LQ-EXE-002](requirements.md#lq-exe-002), [LQ-EXE-003](requirements.md#lq-exe-003), [LQ-EXE-004](requirements.md#lq-exe-004), [LQ-EXE-005](requirements.md#lq-exe-005), [LQ-RSLT-002](requirements.md#lq-rslt-002), [LQ-RSLT-003](requirements.md#lq-rslt-003), [LQ-RSLT-004](requirements.md#lq-rslt-004), [LQ-RSLT-005](requirements.md#lq-rslt-005), [LQ-RSLT-006](requirements.md#lq-rslt-006), [LQ-OBS-003](requirements.md#lq-obs-003), [LQ-QFW-004](requirements.md#lq-qfw-004), [LQ-EXT-001](requirements.md#lq-ext-001), [LQ-EXT-002](requirements.md#lq-ext-002), [LQ-EXT-003](requirements.md#lq-ext-003), [LQ-EXT-004](requirements.md#lq-ext-004), [LQ-EXT-005](requirements.md#lq-ext-005), [LQ-CON-004](requirements.md#lq-con-004), [LQ-CON-005](requirements.md#lq-con-005), [LQ-ENV-004](requirements.md#lq-env-004), [LQ-ENV-005](requirements.md#lq-env-005), [LQ-ENV-006](requirements.md#lq-env-006), [LQ-DEMO-001](requirements.md#lq-demo-001), [LQ-DEMO-002](requirements.md#lq-demo-002), [LQ-DEMO-004](requirements.md#lq-demo-004), [LQ-DEMO-005](requirements.md#lq-demo-005), [LQ-DEMOINT-001](requirements.md#lq-demoint-001), [LQ-DEMOINT-002](requirements.md#lq-demoint-002), [LQ-DEMOINT-003](requirements.md#lq-demoint-003), [LQ-DEMOINT-006](requirements.md#lq-demoint-006), [LQ-FMT-001](requirements.md#lq-fmt-001), [LQ-ADAPT-007](requirements.md#lq-adapt-007), [LQ-ADAPT-009](requirements.md#lq-adapt-009), [LQ-ADAPT-010](requirements.md#lq-adapt-010), [LQ-QUAL-001](requirements.md#lq-qual-001), [LQ-QUAL-002](requirements.md#lq-qual-002), [LQ-QUAL-003](requirements.md#lq-qual-003), [LQ-QUAL-004](requirements.md#lq-qual-004), [LQ-QUAL-005](requirements.md#lq-qual-005), [LQ-QUAL-006](requirements.md#lq-qual-006), [LQ-QUAL-007](requirements.md#lq-qual-007), [LQ-QUAL-008](requirements.md#lq-qual-008)
 
-| Requirements section | Design section |
+This detailed design covers the Python prototype. The requirements below remain part of the requirements artifact but are not defined by this prototype design. They are future design work and require a later design update before implementation.
+
+| Area | Future requirement IDs |
 | --- | --- |
-| Initialization and Finalization | Initialization and Finalization |
-| Allocation Device Discovery and Unified Device Representation | Device Representation; Device Discovery Through QRI |
-| Unified Program Representation | Program Representation |
-| Compiler Registration and Support | Compiler Integration Contract |
-| Compatibility Mapping | Program Route; Compatibility Mapping |
-| Explicit and Automatic Selection; Selection Policies | Route Selection |
-| Compilation and Execution APIs | Application API; Compilation and Execution |
-| Completion Queues; Program Results and Delivery | Completion Queues; Errors, Results, and Provenance |
-| Application Control | Application API; `run()` leaves submission ordering with application code |
-| Diagnostics and Provenance | Errors, Results, and Provenance |
-| QFw Integration Boundaries | Device Discovery Through QRI; Compilation and Execution |
-| Graph Construction and Graph Executor | Deferred; future layers must call the same public API |
-| Native Interfaces and Compiler Extensibility | Deferred beyond the static SC26 Python registrations |
-
-Open work before the contracts can be frozen:
-
-- Confirm the canonical representation registry and exact supported Qiskit and PennyLane object/serialized subsets.
-- Define authoritative QPM input-format/version advertisement and its version negotiation rules.
-- Resolve reservation-scoped authorization for every telemetry method used to build compiler targets.
-- Define QEC and classical resource records and identify their QRI sources before designing Catalyst/Backline routes.
-- Freeze `CompilerInfo` option schemas and all structured error/reason codes.
-- Confirm QFw event types and filters used by the completion dispatcher and the exact ownership-safe `peek_cq`/`read_cq` procedure.
-- Qualify payload serialization, parameter bindings, layout preservation, and any QFw fallback compilation for each SC26 route.
-- Resolve the Catalyst compiled-artifact submission contract and QPM lifecycle before treating Backline as an executable QRI route.
-- Freeze the installable QFw, Qiskit, PennyLane, MQT, and Catalyst revisions used by the demonstration.
+| Program Representation | [LQ-PRG-006](requirements.md#lq-prg-006), [LQ-PRG-009](requirements.md#lq-prg-009) |
+| Route Selection | [LQ-SEL-004](requirements.md#lq-sel-004), [LQ-SEL-005](requirements.md#lq-sel-005), [LQ-SEL-006](requirements.md#lq-sel-006), [LQ-SEL-007](requirements.md#lq-sel-007) |
+| Selection Policies | [LQ-POL-001](requirements.md#lq-pol-001), [LQ-POL-002](requirements.md#lq-pol-002), [LQ-POL-003](requirements.md#lq-pol-003), [LQ-POL-004](requirements.md#lq-pol-004), [LQ-POL-005](requirements.md#lq-pol-005), [LQ-POL-006](requirements.md#lq-pol-006), [LQ-POL-007](requirements.md#lq-pol-007), [LQ-POL-008](requirements.md#lq-pol-008) |
+| Graph Construction | [LQ-GRF-001](requirements.md#lq-grf-001), [LQ-GRF-002](requirements.md#lq-grf-002), [LQ-GRF-003](requirements.md#lq-grf-003), [LQ-GRF-004](requirements.md#lq-grf-004) |
+| Graph Execution | [LQ-EXE-001](requirements.md#lq-exe-001), [LQ-EXE-002](requirements.md#lq-exe-002), [LQ-EXE-003](requirements.md#lq-exe-003), [LQ-EXE-004](requirements.md#lq-exe-004), [LQ-EXE-005](requirements.md#lq-exe-005) |
+| Results | [LQ-RSLT-002](requirements.md#lq-rslt-002), [LQ-RSLT-003](requirements.md#lq-rslt-003), [LQ-RSLT-004](requirements.md#lq-rslt-004), [LQ-RSLT-005](requirements.md#lq-rslt-005), [LQ-RSLT-006](requirements.md#lq-rslt-006) |
+| Diagnostics and Provenance | [LQ-OBS-003](requirements.md#lq-obs-003) |
+| QFw Integration | [LQ-QFW-004](requirements.md#lq-qfw-004) |
+| Native Interfaces and Extensibility | [LQ-EXT-001](requirements.md#lq-ext-001), [LQ-EXT-002](requirements.md#lq-ext-002), [LQ-EXT-003](requirements.md#lq-ext-003), [LQ-EXT-004](requirements.md#lq-ext-004), [LQ-EXT-005](requirements.md#lq-ext-005) |
+| Constraints | [LQ-CON-004](requirements.md#lq-con-004), [LQ-CON-005](requirements.md#lq-con-005) |
+| Implementation Environment | [LQ-ENV-004](requirements.md#lq-env-004), [LQ-ENV-005](requirements.md#lq-env-005), [LQ-ENV-006](requirements.md#lq-env-006) |
+| SC26 Devices and Selection | [LQ-DEMO-001](requirements.md#lq-demo-001), [LQ-DEMO-002](requirements.md#lq-demo-002), [LQ-DEMO-004](requirements.md#lq-demo-004), [LQ-DEMO-005](requirements.md#lq-demo-005) |
+| SC26 Interoperability | [LQ-DEMOINT-001](requirements.md#lq-demoint-001), [LQ-DEMOINT-002](requirements.md#lq-demoint-002), [LQ-DEMOINT-003](requirements.md#lq-demoint-003), [LQ-DEMOINT-006](requirements.md#lq-demoint-006) |
+| Programs and Formats | [LQ-FMT-001](requirements.md#lq-fmt-001) |
+| QFw Runtime Integration | [LQ-ADAPT-007](requirements.md#lq-adapt-007), [LQ-ADAPT-009](requirements.md#lq-adapt-009), [LQ-ADAPT-010](requirements.md#lq-adapt-010) |
+| SC26 Qualification | [LQ-QUAL-001](requirements.md#lq-qual-001), [LQ-QUAL-002](requirements.md#lq-qual-002), [LQ-QUAL-003](requirements.md#lq-qual-003), [LQ-QUAL-004](requirements.md#lq-qual-004), [LQ-QUAL-005](requirements.md#lq-qual-005), [LQ-QUAL-006](requirements.md#lq-qual-006), [LQ-QUAL-007](requirements.md#lq-qual-007), [LQ-QUAL-008](requirements.md#lq-qual-008) |
 
 **Status:** draft
